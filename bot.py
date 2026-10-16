@@ -283,6 +283,40 @@ PERSONAS = {
     },
 }
 
+# ================= سیستم گزارش‌دهی لحظه‌ای وضعیت (Progress Tracker) =================
+class ProgressTracker:
+    def __init__(self, message, initial_text: str = "⏳ در حال پردازش..."):
+        self.trigger_message = message
+        self.status_msg = None
+        self.initial_text = initial_text
+
+    async def start(self):
+        try:
+            self.status_msg = await self.trigger_message.reply_text(self.initial_text)
+        except Exception:
+            pass
+
+    async def update(self, new_text: str):
+        if self.status_msg:
+            try:
+                await self.status_msg.edit_text(new_text)
+            except Exception:
+                pass
+
+    async def finish(self, final_text: str, update_obj: Update):
+        if self.status_msg:
+            if len(final_text) <= 4000:
+                try:
+                    await self.status_msg.edit_text(final_text)
+                    return
+                except Exception:
+                    pass
+            try:
+                await self.status_msg.delete()
+            except Exception:
+                pass
+        await send_long_message(update_obj, final_text)
+
 # ================= توابع کمکی هوش مصنوعی =================
 def build_gemini_session(user_id: str, chat_id: int, use_fallback: bool = False):
     u = db.get_or_create_user(user_id)
@@ -332,10 +366,11 @@ async def send_long_message(update: Update, text: str):
     for i in range(0, len(text), 4000):
         await update.message.reply_text(text[i:i + 4000])
 
-async def reply_with_optional_voice(update: Update, text: str, user_id: str):
-    await send_long_message(update, text)
+async def reply_with_voice_if_enabled(update: Update, text: str, user_id: str, tracker: Optional[ProgressTracker] = None):
     u = db.get_or_create_user(user_id)
     if u["voice_reply"] and len(text) < 1500:
+        if tracker:
+            await tracker.update("🔊 در حال تولید پاسخ صوتی با صدای فارسی...")
         try:
             tts = edge_tts.Communicate(text[:1000], "fa-IR-DilaraNeural")
             audio_buffer = io.BytesIO()
@@ -388,7 +423,7 @@ async def new_chat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     if not check_access(user_id): return
 
-    new_id = db.create_new_chat(user_id, "گفتگوی جدید")
+    db.create_new_chat(user_id, "گفتگوی جدید")
     await update.message.reply_text(
         "➕ **یک گفتگوی کاملاً جدید برات باز شد!**\n\n"
         "چت‌های قبلی‌ات سر جاشونه و هر وقت خواستی با دستور /chats می‌تونی بهشون برگردی.\n"
@@ -445,7 +480,7 @@ async def delete_chat_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not check_access(user_id): return
 
     active_chat = db.get_active_chat(user_id)
-    new_active_id = db.delete_chat(user_id, active_chat["id"])
+    db.delete_chat(user_id, active_chat["id"])
     new_active = db.get_active_chat(user_id)
     await update.message.reply_text(
         f"🗑️ گفتگوی «{active_chat['title']}» حذف شد.\n"
@@ -540,7 +575,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
     elif data == "action:new_chat":
-        new_id = db.create_new_chat(user_id, "گفتگوی جدید")
+        db.create_new_chat(user_id, "گفتگوی جدید")
         await query.edit_message_text("➕ گفتگوی جدید باز شد! پیام خودت رو بفرست.")
 
     elif data.startswith("action:delete_chat:"):
@@ -559,7 +594,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.update_user_setting(user_id, "persona", key)
         await query.edit_message_text(f"✅ تخصص و لحن با موفقیت به `{PERSONAS[key]['title']}` تغییر یافت.", parse_mode="Markdown")
 
-# ================= هندلرهای پیام و چندرسانه‌ای =================
+# ================= هندلرهای پیام و چندرسانه‌ای با گزارش مرحله‌به‌مرحله =================
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
@@ -567,34 +602,56 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
     if not user_text: return
 
+    tracker = ProgressTracker(update.message, "🤔 در حال خواندن پیام و شروع پردازش...")
+    await tracker.start()
+
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
     active_chat = db.get_active_chat(user_id)
+    u = db.get_or_create_user(user_id)
+
+    if u.get("search_enabled"):
+        await tracker.update("🌐 در حال جستجوی زنده در وب و اخبار لحظه‌ای گوگل...")
+    else:
+        await tracker.update("🧠 در حال تفکر و تحلیل پیام توسط هوش مصنوعی...")
 
     try:
         try:
             chat_session = build_gemini_session(user_id, active_chat["id"], use_fallback=False)
             response = chat_session.send_message(user_text)
         except Exception as e_first:
-            logging.warning(f"Primary model busy ({e_first}), switching to fallback 3.5...")
+            logging.warning(f"Primary busy ({e_first}), switching to fallback...")
+            await tracker.update("⚡ در حال سوئیچ به سرور پرسرعت و تولید پاسخ...")
             chat_session = build_gemini_session(user_id, active_chat["id"], use_fallback=True)
             response = chat_session.send_message(user_text)
 
+        await tracker.update("✍️ در حال نهایی‌سازی متن پاسخ...")
         db.add_message(active_chat["id"], "user", user_text)
         db.add_message(active_chat["id"], "model", response.text)
-        await reply_with_optional_voice(update, response.text, user_id)
+        await tracker.finish(response.text, update)
+        await reply_with_voice_if_enabled(update, response.text, user_id, tracker)
+
     except Exception as e:
         logging.error(f"Text error: {e}")
-        await update.message.reply_text("⚠️ ارتباط با هوش مصنوعی موقتاً قطع شد، لطفاً دوباره ارسال کنید.")
+        await tracker.finish("⚠️ خطا در پردازش پیام. لطفاً دوباره تلاش کنید.", update)
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     if not check_access(user_id): return
 
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
-    photo_file = await update.message.photo[-1].get_file()
-    img_bytearray = await photo_file.download_as_bytearray()
-    caption = update.message.caption or "این عکس رو با لحن عامیانه تحلیل کن و بگو چیه."
+    tracker = ProgressTracker(update.message, "📸 در حال دانلود تصویر از تلگرام...")
+    await tracker.start()
 
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+    try:
+        photo_file = await update.message.photo[-1].get_file()
+        img_bytearray = await photo_file.download_as_bytearray()
+    except Exception:
+        await tracker.finish("⚠️ خطا در دانلود تصویر از تلگرام.", update)
+        return
+
+    await tracker.update("👁️ در حال اسکن و تحلیل بینایی عکس توسط جمینای...")
+
+    caption = update.message.caption or "این عکس رو با لحن عامیانه تحلیل کن و بگو چیه."
     active_chat = db.get_active_chat(user_id)
     u = db.get_or_create_user(user_id)
     model_info = AVAILABLE_MODELS.get(u["model"], AVAILABLE_MODELS["flash_38_med"])
@@ -613,18 +670,28 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         db.add_message(active_chat["id"], "user", f"[ارسال تصویر]: {caption}")
         db.add_message(active_chat["id"], "model", response.text)
-        await reply_with_optional_voice(update, response.text, user_id)
+        await tracker.finish(response.text, update)
+        await reply_with_voice_if_enabled(update, response.text, user_id, tracker)
     except Exception as e:
         logging.error(f"Photo error: {e}")
-        await update.message.reply_text("⚠️ خطا در پردازش و تحلیل تصویر.")
+        await tracker.finish("⚠️ خطا در پردازش و تحلیل تصویر.", update)
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     if not check_access(user_id): return
 
+    tracker = ProgressTracker(update.message, "🎙️ در حال دانلود پیام صوتی...")
+    await tracker.start()
+
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.RECORD_VOICE)
-    voice_file = await update.message.voice.get_file()
-    voice_bytes = await voice_file.download_as_bytearray()
+    try:
+        voice_file = await update.message.voice.get_file()
+        voice_bytes = await voice_file.download_as_bytearray()
+    except Exception:
+        await tracker.finish("⚠️ خطا در دریافت فایل ویس.", update)
+        return
+
+    await tracker.update("🎧 در حال شنیدن و پردازش صوت توسط جمینای...")
 
     active_chat = db.get_active_chat(user_id)
     u = db.get_or_create_user(user_id)
@@ -632,22 +699,19 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         audio_part = types.Part.from_bytes(data=bytes(voice_bytes), mime_type="audio/ogg")
+        prompt = ["این پیام صوتی را گوش بده و جوابش رو صمیمی و عامیانه به فارسی بگو:", audio_part]
         try:
-            response = client.models.generate_content(
-                model=model_info["model_id"],
-                contents=["این پیام صوتی را گوش بده و جوابش رو صمیمی و عامیانه به فارسی بگو:", audio_part]
-            )
+            response = client.models.generate_content(model=model_info["model_id"], contents=prompt)
         except Exception:
-            response = client.models.generate_content(
-                model=model_info["fallback_id"],
-                contents=["این پیام صوتی را گوش بده و جوابش رو صمیمی و عامیانه به فارسی بگو:", audio_part]
-            )
+            response = client.models.generate_content(model=model_info["fallback_id"], contents=prompt)
+
         db.add_message(active_chat["id"], "user", "[ارسال پیام صوتی]")
         db.add_message(active_chat["id"], "model", response.text)
-        await reply_with_optional_voice(update, response.text, user_id)
+        await tracker.finish(response.text, update)
+        await reply_with_voice_if_enabled(update, response.text, user_id, tracker)
     except Exception as e:
         logging.error(f"Voice error: {e}")
-        await update.message.reply_text("⚠️ خطا در شنیدن یا پردازش ویس.")
+        await tracker.finish("⚠️ خطا در شنیدن یا پردازش ویس.", update)
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
@@ -658,13 +722,18 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ حجم این فایل بیشتر از ۲۰ مگابایت است! طبق قوانین تلگرام ربات‌ها فقط فایل‌های کمتر از ۲۰ مگابایت را می‌توانند دریافت کنند. لطفاً حجم فایل را کم کنید یا صفحات مورد نظرتان را به صورت عکس بفرستید.")
         return
 
+    tracker = ProgressTracker(update.message, f"📥 در حال دریافت و دانلود فایل «{doc.file_name}»...")
+    await tracker.start()
+
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
     try:
         doc_file = await doc.get_file()
         doc_bytes = await doc_file.download_as_bytearray()
-    except Exception as e:
-        await update.message.reply_text("⚠️ خطا در دانلود فایل از تلگرام. لطفاً مجدداً بفرستید.")
+    except Exception:
+        await tracker.finish("⚠️ خطا در دانلود فایل از تلگرام. لطفاً مجدداً بفرستید.", update)
         return
+
+    await tracker.update("📑 فایل با موفقیت دریافت شد. در حال مطالعه و استخراج محتوا...")
 
     prompt = update.message.caption or "این فایل رو کامل بخون و نکات مهمش رو به زبان عامیانه خلاصه کن."
     active_chat = db.get_active_chat(user_id)
@@ -672,24 +741,22 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     model_info = AVAILABLE_MODELS.get(u["model"], AVAILABLE_MODELS["flash_38_med"])
 
     try:
+        await tracker.update("🧠 در حال تحلیل و پاسخ‌دهی هوشمند توسط جمینای...")
         mime = doc.mime_type or "application/pdf"
         file_part = types.Part.from_bytes(data=bytes(doc_bytes), mime_type=mime)
+        contents = [prompt, file_part]
         try:
-            response = client.models.generate_content(
-                model=model_info["model_id"],
-                contents=[prompt, file_part]
-            )
+            response = client.models.generate_content(model=model_info["model_id"], contents=contents)
         except Exception:
-            response = client.models.generate_content(
-                model=model_info["fallback_id"],
-                contents=[prompt, file_part]
-            )
+            response = client.models.generate_content(model=model_info["fallback_id"], contents=contents)
+
         db.add_message(active_chat["id"], "user", f"[ارسال فایل {doc.file_name}]: {prompt}")
         db.add_message(active_chat["id"], "model", response.text)
-        await reply_with_optional_voice(update, response.text, user_id)
+        await tracker.finish(response.text, update)
+        await reply_with_voice_if_enabled(update, response.text, user_id, tracker)
     except Exception as e:
         logging.error(f"Doc error: {e}")
-        await update.message.reply_text("⚠️ خطا در خواندن یا تحلیل فایل.")
+        await tracker.finish("⚠️ خطا در خواندن یا تحلیل فایل.", update)
 
 # ================= استارت نهایی =================
 if __name__ == "__main__":
@@ -714,5 +781,5 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
 
-    print("Gemini Multi-Session AI Bot is live and running...")
+    print("Gemini Multi-Session AI Bot with Live Progress Tracking is live...")
     app.run_polling()
