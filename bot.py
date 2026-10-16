@@ -198,7 +198,6 @@ class Database:
             )
             cursor.execute("UPDATE chats SET updated_at = ? WHERE id = ?", (now, chat_id))
             
-            # تغییر خودکار عنوان چت بر اساس پیام اول کاربر
             cursor.execute("SELECT COUNT(*) as cnt FROM messages WHERE chat_id = ? AND role = 'user'", (chat_id,))
             user_cnt = cursor.fetchone()["cnt"]
             if user_cnt == 1 and role == 'user':
@@ -230,26 +229,31 @@ db = Database()
 AVAILABLE_MODELS = {
     "flash_38_low": {
         "model_id": "gemini-3.8-flash",
+        "fallback_id": "gemini-3.5-flash",
         "title": "🟢 3.8 Flash (Low Effort)",
         "thinking_budget": 1024,
     },
     "flash_38_med": {
         "model_id": "gemini-3.8-flash",
+        "fallback_id": "gemini-3.5-flash",
         "title": "🟡 3.8 Flash (Medium Effort) [پیش‌فرض]",
         "thinking_budget": 4096,
     },
     "flash_38_high": {
         "model_id": "gemini-3.8-flash",
+        "fallback_id": "gemini-3.5-flash",
         "title": "🔴 3.8 Flash (High Effort - تفکر عمیق)",
         "thinking_budget": 8192,
     },
     "pro_model": {
-        "model_id": "gemini-2.5-pro",
-        "title": "💎 Gemini Pro (هوش فوق‌العاده / تحلیلی)",
+        "model_id": "gemini-3.5-flash",
+        "fallback_id": "gemini-3.5-flash",
+        "title": "💎 Gemini Flash 3.5 (فوق‌العاده سریع و پایدار)",
         "thinking_budget": None,
     },
     "argon_4": {
         "model_id": "gemini-4-argon",
+        "fallback_id": "gemini-3.5-flash",
         "title": "🚀 Gemini 4 Argon",
         "thinking_budget": None,
     },
@@ -280,7 +284,7 @@ PERSONAS = {
 }
 
 # ================= توابع کمکی هوش مصنوعی =================
-def build_gemini_session(user_id: str, chat_id: int):
+def build_gemini_session(user_id: str, chat_id: int, use_fallback: bool = False):
     u = db.get_or_create_user(user_id)
     model_info = AVAILABLE_MODELS.get(u["model"], AVAILABLE_MODELS["flash_38_med"])
     persona_info = PERSONAS.get(u["persona"], PERSONAS["general"])
@@ -289,14 +293,19 @@ def build_gemini_session(user_id: str, chat_id: int):
     if u["search_enabled"]:
         tools.append(types.Tool(google_search=types.GoogleSearch()))
 
+    thinking_cfg = None
+    if model_info.get("thinking_budget") is not None and not use_fallback:
+        try:
+            thinking_cfg = types.ThinkingConfig(thinking_budget=model_info["thinking_budget"])
+        except Exception:
+            thinking_cfg = None
+
     gen_config = types.GenerateContentConfig(
         system_instruction=persona_info["prompt"],
         tools=tools if tools else None,
-        thinking_config=types.ThinkingConfig(thinking_budget=model_info["thinking_budget"])
-        if model_info["thinking_budget"] is not None else None,
+        thinking_config=thinking_cfg,
     )
 
-    # بازسازی کل سابقه این چت از دیتابیس
     history_records = db.get_chat_messages(chat_id, limit=30)
     history = []
     for role, content in history_records:
@@ -307,8 +316,9 @@ def build_gemini_session(user_id: str, chat_id: int):
             )
         )
 
+    target_model = model_info["fallback_id"] if use_fallback else model_info["model_id"]
     return client.chats.create(
-        model=model_info["model_id"],
+        model=target_model,
         config=gen_config,
         history=history
     )
@@ -559,16 +569,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
     active_chat = db.get_active_chat(user_id)
-    chat_session = build_gemini_session(user_id, active_chat["id"])
 
     try:
-        response = chat_session.send_message(user_text)
+        try:
+            chat_session = build_gemini_session(user_id, active_chat["id"], use_fallback=False)
+            response = chat_session.send_message(user_text)
+        except Exception as e_first:
+            logging.warning(f"Primary model busy ({e_first}), switching to fallback 3.5...")
+            chat_session = build_gemini_session(user_id, active_chat["id"], use_fallback=True)
+            response = chat_session.send_message(user_text)
+
         db.add_message(active_chat["id"], "user", user_text)
         db.add_message(active_chat["id"], "model", response.text)
         await reply_with_optional_voice(update, response.text, user_id)
     except Exception as e:
         logging.error(f"Text error: {e}")
-        await update.message.reply_text("⚠️ ارتباطم با جمینای قطع شد، لطفاً دوباره ارسال کنید.")
+        await update.message.reply_text("⚠️ ارتباط با هوش مصنوعی موقتاً قطع شد، لطفاً دوباره ارسال کنید.")
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
@@ -585,10 +601,16 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         image_part = types.Part.from_bytes(data=bytes(img_bytearray), mime_type="image/jpeg")
-        response = client.models.generate_content(
-            model=model_info["model_id"],
-            contents=[caption, image_part]
-        )
+        try:
+            response = client.models.generate_content(
+                model=model_info["model_id"],
+                contents=[caption, image_part]
+            )
+        except Exception:
+            response = client.models.generate_content(
+                model=model_info["fallback_id"],
+                contents=[caption, image_part]
+            )
         db.add_message(active_chat["id"], "user", f"[ارسال تصویر]: {caption}")
         db.add_message(active_chat["id"], "model", response.text)
         await reply_with_optional_voice(update, response.text, user_id)
@@ -610,10 +632,16 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         audio_part = types.Part.from_bytes(data=bytes(voice_bytes), mime_type="audio/ogg")
-        response = client.models.generate_content(
-            model=model_info["model_id"],
-            contents=["این پیام صوتی را گوش بده و جوابش رو صمیمی و عامیانه به فارسی بگو:", audio_part]
-        )
+        try:
+            response = client.models.generate_content(
+                model=model_info["model_id"],
+                contents=["این پیام صوتی را گوش بده و جوابش رو صمیمی و عامیانه به فارسی بگو:", audio_part]
+            )
+        except Exception:
+            response = client.models.generate_content(
+                model=model_info["fallback_id"],
+                contents=["این پیام صوتی را گوش بده و جوابش رو صمیمی و عامیانه به فارسی بگو:", audio_part]
+            )
         db.add_message(active_chat["id"], "user", "[ارسال پیام صوتی]")
         db.add_message(active_chat["id"], "model", response.text)
         await reply_with_optional_voice(update, response.text, user_id)
@@ -626,11 +654,19 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not check_access(user_id): return
 
     doc = update.message.document
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
-    doc_file = await doc.get_file()
-    doc_bytes = await doc_file.download_as_bytearray()
-    prompt = update.message.caption or "این فایل رو کامل بخون و نکات مهمش رو به زبان عامیانه خلاصه کن."
+    if doc.file_size and doc.file_size > 20 * 1024 * 1024:
+        await update.message.reply_text("⚠️ حجم این فایل بیشتر از ۲۰ مگابایت است! طبق قوانین تلگرام ربات‌ها فقط فایل‌های کمتر از ۲۰ مگابایت را می‌توانند دریافت کنند. لطفاً حجم فایل را کم کنید یا صفحات مورد نظرتان را به صورت عکس بفرستید.")
+        return
 
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+    try:
+        doc_file = await doc.get_file()
+        doc_bytes = await doc_file.download_as_bytearray()
+    except Exception as e:
+        await update.message.reply_text("⚠️ خطا در دانلود فایل از تلگرام. لطفاً مجدداً بفرستید.")
+        return
+
+    prompt = update.message.caption or "این فایل رو کامل بخون و نکات مهمش رو به زبان عامیانه خلاصه کن."
     active_chat = db.get_active_chat(user_id)
     u = db.get_or_create_user(user_id)
     model_info = AVAILABLE_MODELS.get(u["model"], AVAILABLE_MODELS["flash_38_med"])
@@ -638,10 +674,16 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         mime = doc.mime_type or "application/pdf"
         file_part = types.Part.from_bytes(data=bytes(doc_bytes), mime_type=mime)
-        response = client.models.generate_content(
-            model=model_info["model_id"],
-            contents=[prompt, file_part]
-        )
+        try:
+            response = client.models.generate_content(
+                model=model_info["model_id"],
+                contents=[prompt, file_part]
+            )
+        except Exception:
+            response = client.models.generate_content(
+                model=model_info["fallback_id"],
+                contents=[prompt, file_part]
+            )
         db.add_message(active_chat["id"], "user", f"[ارسال فایل {doc.file_name}]: {prompt}")
         db.add_message(active_chat["id"], "model", response.text)
         await reply_with_optional_voice(update, response.text, user_id)
@@ -653,7 +695,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 if __name__ == "__main__":
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
-    # مدیریت چت‌ها و گفتگوهای چندگانه
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("new", new_chat_command))
     app.add_handler(CommandHandler("chats", list_chats_command))
@@ -662,13 +703,11 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("clear", clear))
     app.add_handler(CommandHandler("export", export_chat))
 
-    # تنظیمات مدل، پرسونالایز و ابزارها
     app.add_handler(CommandHandler("model", model_menu))
     app.add_handler(CommandHandler("persona", persona_menu))
     app.add_handler(CommandHandler("search", toggle_search))
     app.add_handler(CommandHandler("voice", toggle_voice))
 
-    # پردازش دکمه‌ها و ورودی‌ها
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
