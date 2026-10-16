@@ -5,6 +5,8 @@ import asyncio
 import logging
 import sqlite3
 import datetime
+import zipfile
+import xml.etree.ElementTree as ET
 from typing import List, Tuple, Optional, Dict
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -332,13 +334,6 @@ class ProgressTracker:
         except asyncio.CancelledError:
             pass
 
-    async def update_custom(self, text: str):
-        if self.status_msg:
-            try:
-                await self.status_msg.edit_text(text)
-            except Exception:
-                pass
-
     async def finish(self, final_text: str, update_obj: Update):
         if self.start_time:
             elapsed = time.time() - self.start_time
@@ -453,6 +448,16 @@ async def generate_multimodal_response(user_id: str, contents: list) -> str:
 
     raise last_error
 
+def extract_docx_text(docx_bytes: bytes) -> Optional[str]:
+    try:
+        with zipfile.ZipFile(io.BytesIO(docx_bytes)) as z:
+            xml_content = z.read("word/document.xml")
+            tree = ET.fromstring(xml_content)
+            texts = [node.text for node in tree.iter() if node.tag.endswith("}t") and node.text]
+            return " ".join(texts)
+    except Exception:
+        return None
+
 def check_access(user_id: str) -> bool:
     if not ALLOWED_USERS or "" in ALLOWED_USERS:
         return True
@@ -511,7 +516,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🎭 /persona : تغییر لحن و تخصص من\n"
         "🌐 /search : سرچ زنده گوگل\n"
         "🔊 /voice : فعال‌سازی پاسخ با ویس فارسی\n\n"
-        "📸 *راستی! هر عکس، ویس یا فایل PDF هم بفرستی با کمال میل برات تحلیلش می‌کنم.*"
+        "🎬 *هر نوع فایلی (عکس، ویس، آهنگ، ویدیو، فیلم، PDF، اسناد Word و کدهای برنامه‌نویسی) بفرستی با کمال میل برات تحلیل و ترجمه‌ش می‌کنم.*"
     )
     await update.message.reply_text(welcome_text, parse_mode="Markdown")
 
@@ -763,43 +768,113 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logging.error(f"Photo error: {e}")
         await tracker.finish("⚠️ خطا در پردازش و تحلیل تصویر.", update)
 
-async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     if not check_access(user_id): return
-    if not update.message or not update.message.voice: return
+    if not update.message: return
+
+    is_voice = bool(update.message.voice)
+    audio_obj = update.message.voice if is_voice else update.message.audio
+    if not audio_obj: return
+
+    if audio_obj.file_size and audio_obj.file_size > 20 * 1024 * 1024:
+        await update.message.reply_text("⚠️ حجم این فایل صوتی بیشتر از ۲۰ مگابایت است! تلگرام به ربات‌ها اجازه دانلود فایل‌های بالای ۲۰ مگابایت را نمی‌دهد. لطفاً فایل را فشرده کنید یا بخش‌های کوتاه‌تر آن را بفرستید.")
+        return
+
+    file_title = getattr(audio_obj, "file_name", "پیام صوتی") or "پیام صوتی"
+    caption = update.message.caption or (
+        "این پیام صوتی را گوش بده و جوابش رو صمیمی و عامیانه به فارسی بگو:" if is_voice
+        else f"این فایل صوتی ({file_title}) را کامل و با دقت گوش بده. اگر تمرین، لیسنینگ زبان انگلیسی، یا مکالمه است، متن کامل صحبت‌ها (Transcript)، ترجمه یا پاسخ سوالاتش را دقیق و کامل بگو:"
+    )
 
     steps = [
-        "🎙️ در حال دریافت فایل صوتی از تلگرام...",
-        "🎧 در حال گوش دادن و تبدیل گفتار صوتی به متن...",
-        "🧠 در حال تفکر و پردازش پاسخ توسط جمینای...",
-        "✍️ در حال تدوین و ارسال پاسخ نهایی..."
+        f"🎙️ در حال دانلود و دریافت فایل صوتی ({file_title}) از تلگرام...",
+        "🎧 در حال گوش دادن و پردازش دقیق صدا توسط جمینای...",
+        "🧠 در حال درک کلمات، لهجه و تحلیل مفاهیم گفتار...",
+        "✍️ در حال استخراج متن و نگارش پاسخ نهایی..."
     ]
     tracker = ProgressTracker(update.message, steps, min_step_duration=1.4, min_total_duration=2.5)
     await tracker.start()
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.RECORD_VOICE)
 
     try:
-        voice_file = await update.message.voice.get_file()
-        voice_bytes = await voice_file.download_as_bytearray()
-    except Exception:
-        await tracker.finish("⚠️ خطا در دانلود ویس از تلگرام.", update)
+        audio_file = await audio_obj.get_file()
+        audio_bytes = await audio_file.download_as_bytearray()
+    except Exception as e:
+        logging.error(f"Audio download error: {e}")
+        await tracker.finish("⚠️ خطا در دانلود فایل صوتی از تلگرام.", update)
         return
 
     active_chat = db.get_active_chat(user_id)
+    mime = "audio/ogg" if is_voice else (getattr(audio_obj, "mime_type", None) or "audio/mp3")
 
     try:
-        audio_part = types.Part.from_bytes(data=bytes(voice_bytes), mime_type="audio/ogg")
+        audio_part = types.Part.from_bytes(data=bytes(audio_bytes), mime_type=mime)
         reply_text = await generate_multimodal_response(
             user_id,
-            ["این پیام صوتی را گوش بده و جوابش رو صمیمی و عامیانه به فارسی بگو:", audio_part]
+            [caption, audio_part]
         )
-        db.add_message(active_chat["id"], "user", "[ارسال پیام صوتی]")
+        db.add_message(active_chat["id"], "user", f"[ارسال فایل صوتی {file_title}]: {caption}")
         db.add_message(active_chat["id"], "model", reply_text)
         await tracker.finish(reply_text, update)
         await reply_with_optional_voice(update, reply_text, user_id, send_text=False)
     except Exception as e:
-        logging.error(f"Voice error: {e}")
-        await tracker.finish("⚠️ خطا در شنیدن یا پردازش ویس.", update)
+        logging.error(f"Voice/Audio error: {e}")
+        await tracker.finish("⚠️ خطا در شنیدن یا تحلیل فایل صوتی با هوش مصنوعی.", update)
+
+async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    if not check_access(user_id): return
+    if not update.message: return
+
+    vid_obj = update.message.video or update.message.video_note or update.message.animation
+    if not vid_obj: return
+
+    if vid_obj.file_size and vid_obj.file_size > 20 * 1024 * 1024:
+        await update.message.reply_text("⚠️ حجم این ویدیو بیشتر از ۲۰ مگابایت است! طبق قوانین تلگرام ربات‌ها فقط فایل‌های کمتر از ۲۰ مگابایت را می‌توانند دریافت کنند. لطفاً ویدیوی کوتاه‌تر یا کم‌حجم‌تر ارسال کنید.")
+        return
+
+    is_note = bool(update.message.video_note)
+    file_title = getattr(vid_obj, "file_name", "پیام ویدیویی") or "ویدیو"
+    caption = update.message.caption or (
+        "این ویدیو مسیج دایره‌ای را کامل ببین و بشنو و جوابش رو صمیمی و عامیانه بگو:" if is_note
+        else f"این ویدیو ({file_title}) را کامل از نظر بصری و صوتی تماشا کن. اتفاقات رخ داده، صحبت‌ها و نکات مهم آن را به طور کامل و جذاب به فارسی توضیح بده:"
+    )
+
+    steps = [
+        f"🎬 در حال دانلود و دریافت ویدیو ({file_title}) از تلگرام...",
+        "🎞️ در حال آنالیز فریم‌های تصویر و تفکیک جریان صدا...",
+        "🧠 در حال پردازش خط زمانی ویدیو و رویدادها با جمینای...",
+        "✍️ در حال نگارش خلاصه و تحلیل جامع محتوای فیلم..."
+    ]
+    tracker = ProgressTracker(update.message, steps, min_step_duration=1.6, min_total_duration=3.0)
+    await tracker.start()
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.RECORD_VIDEO)
+
+    try:
+        vid_file = await vid_obj.get_file()
+        vid_bytes = await vid_file.download_as_bytearray()
+    except Exception as e:
+        logging.error(f"Video download error: {e}")
+        await tracker.finish("⚠️ خطا در دانلود ویدیو از تلگرام. لطفاً مجدداً ارسال کنید.", update)
+        return
+
+    active_chat = db.get_active_chat(user_id)
+    mime = getattr(vid_obj, "mime_type", None) or "video/mp4"
+
+    try:
+        vid_part = types.Part.from_bytes(data=bytes(vid_bytes), mime_type=mime)
+        reply_text = await generate_multimodal_response(
+            user_id,
+            [caption, vid_part]
+        )
+        db.add_message(active_chat["id"], "user", f"[ارسال ویدیو {file_title}]: {caption}")
+        db.add_message(active_chat["id"], "model", reply_text)
+        await tracker.finish(reply_text, update)
+        await reply_with_optional_voice(update, reply_text, user_id, send_text=False)
+    except Exception as e:
+        logging.error(f"Video processing error: {e}")
+        await tracker.finish("⚠️ خطا در تماشا و تحلیل ویدیو با هوش مصنوعی.", update)
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
@@ -812,8 +887,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     steps = [
-        "📥 در حال دانلود و اعتبارسنجی سند از تلگرام...",
-        "📑 در حال استخراج محتوا و تفکیک صفحات سند...",
+        f"📥 در حال دانلود و دریافت فایل ({doc.file_name or 'سند'}) از تلگرام...",
+        "📑 در حال استخراج محتوا و تفکیک ساختار داده‌ها...",
         "🧠 در حال مطالعه عمیق و تحلیل دقیق متن با جمینای...",
         "✍️ در حال خلاصه‌سازی و نگارش گزارش نهایی..."
     ]
@@ -828,20 +903,54 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await tracker.finish("⚠️ خطا در دانلود فایل از تلگرام. لطفاً مجدداً بفرستید.", update)
         return
 
-    prompt = update.message.caption or "این فایل رو کامل بخون و نکات مهمش رو به زبان عامیانه خلاصه کن."
+    file_name = (doc.file_name or "file").lower()
+    prompt = update.message.caption or f"این فایل ({doc.file_name or 'سند'}) رو کامل و دقیق بررسی کن و نکات، تحلیل‌ها، ترجمه یا پاسخ‌های مهمش رو به زبان عامیانه و شیوا بگو."
     active_chat = db.get_active_chat(user_id)
 
     try:
-        mime = doc.mime_type or "application/pdf"
-        file_part = types.Part.from_bytes(data=bytes(doc_bytes), mime_type=mime)
-        reply_text = await generate_multimodal_response(user_id, [prompt, file_part])
+        # ۱. اگر فایل ورد (.docx) باشد: استخراج خودکار متن
+        if file_name.endswith(".docx"):
+            extracted = extract_docx_text(bytes(doc_bytes))
+            if extracted:
+                content_payload = f"{prompt}\n\n[متن استخراج‌شده از سند Word ({doc.file_name})]:\n{extracted[:120000]}"
+                reply_text = await generate_chat_response(user_id, active_chat["id"], content_payload)
+            else:
+                reply_text = "⚠️ فایل Word باز شد اما متنی داخل آن پیدا نشد یا فایل محافظت‌شده است."
+
+        # ۲. اگر فایل‌های متنی یا کدهای برنامه‌نویسی باشد (.txt, .py, .csv, .json, .md, .html, .c, .cpp, .js, ...)
+        elif any(file_name.endswith(ext) for ext in [
+            ".txt", ".py", ".csv", ".json", ".md", ".html", ".css", ".js", ".ts", 
+            ".c", ".cpp", ".h", ".java", ".sql", ".sh", ".xml", ".log", ".yaml", ".yml"
+        ]):
+            try:
+                text_content = doc_bytes.decode("utf-8", errors="replace")
+                content_payload = f"{prompt}\n\n[محتوای فایل {doc.file_name}]:\n```\n{text_content[:120000]}\n```"
+                reply_text = await generate_chat_response(user_id, active_chat["id"], content_payload)
+            except Exception:
+                file_part = types.Part.from_bytes(data=bytes(doc_bytes), mime_type="text/plain")
+                reply_text = await generate_multimodal_response(user_id, [prompt, file_part])
+
+        # ۳. سایر فایل‌های چندرسانه‌ای و باینری (PDF, تصویر, صوت, ویدیو)
+        else:
+            mime = doc.mime_type or "application/pdf"
+            if file_name.endswith(".pdf"): mime = "application/pdf"
+            elif file_name.endswith((".mp3", ".wav", ".m4a", ".ogg", ".flac", ".aac")):
+                mime = "audio/mp3" if file_name.endswith(".mp3") else "audio/wav"
+            elif file_name.endswith((".mp4", ".mov", ".avi", ".mkv", ".webm")):
+                mime = "video/mp4"
+            elif file_name.endswith((".png", ".jpg", ".jpeg", ".webp", ".heic")):
+                mime = "image/jpeg"
+
+            file_part = types.Part.from_bytes(data=bytes(doc_bytes), mime_type=mime)
+            reply_text = await generate_multimodal_response(user_id, [prompt, file_part])
+
         db.add_message(active_chat["id"], "user", f"[ارسال فایل {doc.file_name}]: {prompt}")
         db.add_message(active_chat["id"], "model", reply_text)
         await tracker.finish(reply_text, update)
         await reply_with_optional_voice(update, reply_text, user_id, send_text=False)
     except Exception as e:
         logging.error(f"Doc error: {e}")
-        await tracker.finish("⚠️ خطا در خواندن یا تحلیل فایل.", update)
+        await tracker.finish(f"⚠️ خطا در تحلیل فایل ({e})", update)
 
 # ================= استارت نهایی =================
 if __name__ == "__main__":
@@ -862,7 +971,8 @@ if __name__ == "__main__":
 
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
+    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_audio))
+    app.add_handler(MessageHandler(filters.VIDEO | filters.VIDEO_NOTE | filters.ANIMATION, handle_video))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
 
