@@ -1751,26 +1751,37 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     active_chat = db.get_active_chat(user_id)
 
     welcome_text = (
-        "سلام! من دستیار هوش مصنوعی جمنای ابوالفضل هستم. چه کمکی از من برمیاد؟ 😉\n\n"
+        "سلام! من دستیار هوش مصنوعی همه‌فن‌حریف جمینای هستم. چه کمکی از دستم برمیاد؟ 😉\n\n"
         f"💬 **گفتگوی فعال فعلی:** `{active_chat['title']}`\n"
         "🟡 **مدل فعال:** Gemini 3.8 Flash (تفکر استاندارد)\n"
         "🌐 **سرچ زنده اینترنت:** خاموش (با /search روشن می‌شه)\n"
         "🔊 **پاسخ صوتی:** خاموش (با /voice روشن می‌شه)\n\n"
+        "🌟 **امکانات و قابلیت‌های هوشمند ربات:**\n"
+        "🎨 **تولید تصویر با هوش مصنوعی:**\n"
+        "▫️ `/draw` یا `/image <توصیف>` : خلق تصاویر باکیفیت با Imagen 3\n\n"
+        "⏰ **یادآور و زمان‌بندی هوشمند:**\n"
+        "▫️ `/remind 15m پیام` یا ارسال پیام‌های عامیانه مثل: «فردا ساعت ۸ صبح یادم بنداز جزوه رو بخونم»\n\n"
+        "🌐 **خلاصه‌ساز وب‌سایت‌ها و ویدیوهای یوتیوب:**\n"
+        "▫️ ارسال لینک وب‌سایت‌ها یا ویدیوهای YouTube (یا ریپلای روی آن‌ها) جهت استخراج و خلاصه‌سازی نکات کلیدی\n\n"
+        "📊 **ساخت جداول اکسل، فایل PDF و رسم نمودار:**\n"
+        "▫️ فقط بگو «یه جدول اکسل از نمرات بساز» یا «نمودار مقایسه‌ای بکش» تا فایل آماده رو برات ارسال کنم\n\n"
+        "↩️ **ریپلای هوشمند (درک زمینه پیام):**\n"
+        "▫️ روی هر پیام، عکس، فایل، ویس، ویدیو یا پاسخ ربات ریپلای کن و سوالت رو بپرس («این چیه؟»، «خلاصه‌ش کن»)\n\n"
+        "🧠 **محاسبات ریاضی دقیق و تفکر عمیق:**\n"
+        "▫️ حل خودکار محاسبات با اجرای زنده کدهای پایتون و دکمه اختصاصی مشاهده زنجیره تفکر عمیق (Thinking)\n\n"
         "🗂️ **مدیریت گفتگوها و تاریخچه:**\n"
-        "➕ /new : شروع یک گفتگوی جدید بدون پاک شدن قبلی‌ها\n"
-        "📂 /chats : دیدن لیست چت‌های قبلی و بازگشت به هرکدام\n"
-        "✏️ /rename <اسم جدید> : تغییر نام چت فعلی\n"
-        "🗑️ /delete : حذف این گفتگو\n"
-        "🧹 /clear : پاک کردن پیام‌های چت فعلی\n"
-        "📁 /export : دانلود فایل تاریخچه چت فعلی\n\n"
-        "🎨 **خلق تصویر با هوش مصنوعی:**\n"
-        "🖼️ /draw یا /image <توصیف> : ساخت تصویر با هوش مصنوعی Imagen 3\n\n"
-        "⚙️ **تنظیمات هوش مصنوعی:**\n"
-        "🔘 /model : انتخاب مدل و سطح تفکر\n"
-        "🎭 /persona : تغییر لحن و تخصص من\n"
-        "🌐 /search : سرچ زنده گوگل\n"
-        "🔊 /voice : فعال‌سازی پاسخ با ویس فارسی\n\n"
-        "🎬 *محاسبات ریاضی دقیق، اجرای خودکار کدهای پایتون، تحلیل تصاویر، ویس، ویدیو و اسناد با هوش مصنوعی جمینای.*"
+        "➕ `/new` : شروع گفتگوی جدید بدون پاک شدن چت‌های قبلی\n"
+        "📂 `/chats` : دیدن لیست چت‌های گذشته و جابجایی بین آن‌ها\n"
+        "✏️ `/rename <اسم جدید>` : تغییر نام گفتگوی فعلی\n"
+        "🗑️ `/delete` : حذف گفتگوی فعلی\n"
+        "🧹 `/clear` : پاک کردن پیام‌های چت فعلی\n"
+        "📁 `/export` : دریافت خروجی کامل تاریخچه چت (Excel / PDF / Text)\n\n"
+        "⚙️ **تنظیمات و شخصی‌سازی:**\n"
+        "🔘 `/model` : تغییر مدل جمینای و سطح تفکر عمیق\n"
+        "🎭 `/persona` : تغییر لحن، زبان و تخصص من\n"
+        "🌐 `/search` : فعال/غیرفعال‌سازی سرچ زنده گوگل\n"
+        "🔊 `/voice` : فعال‌سازی پاسخ با ویس فارسی\n\n"
+        "📎 *می‌تونی هر نوع عکس، صدا، ویدیو، وویس یا سندی (Word, PDF, TXT, کد) رو هم بفرستی تا برات دقیق تحلیل و بررسی کنم!*"
     )
     await update.message.reply_text(welcome_text, parse_mode="Markdown")
 
@@ -3270,8 +3281,27 @@ async def recover_server_reboot_reminders(application):
 
 async def post_init(application):
     """
-    PTB post_init hook: executes server reboot recovery and spawns autonomous scheduler.
+    PTB post_init hook: executes server reboot recovery, registers command menu, and spawns autonomous scheduler.
     """
+    try:
+        from telegram import BotCommand
+        commands = [
+            BotCommand("start", "راهنمای کامل و معرفی قابلیت‌ها"),
+            BotCommand("new", "شروع گفتگوی جدید"),
+            BotCommand("chats", "لیست و انتخاب گفتگوها"),
+            BotCommand("draw", "تولید تصویر با هوش مصنوعی"),
+            BotCommand("remind", "تنظیم یادآور هوشمند"),
+            BotCommand("model", "انتخاب مدل و تفکر عمیق"),
+            BotCommand("persona", "تغییر لحن و شخصیت"),
+            BotCommand("search", "سرچ زنده در اینترنت"),
+            BotCommand("voice", "پاسخ صوتی و ویس فارسی"),
+            BotCommand("export", "دانلود خروجی تاریخچه چت"),
+            BotCommand("clear", "پاکسازی پیام‌های چت فعلی"),
+        ]
+        await application.bot.set_my_commands(commands)
+    except Exception as e:
+        logging.warning(f"Could not register Telegram bot commands: {e}")
+
     await recover_server_reboot_reminders(application)
     asyncio.create_task(reminder_scheduler_loop(application))
 
