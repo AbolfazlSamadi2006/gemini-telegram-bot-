@@ -1,3 +1,12 @@
-python-telegram-bot==21.10
-google-genai>=2.30.0
-edge-tts==6.1.19
+python-telegram-bot>=22.0
+google-genai>=1.0.0
+edge-tts>=7.0.0
+httpx>=0.28.0
+beautifulsoup4>=4.12.0
+youtube-transcript-api>=1.2.0
+openpyxl>=3.1.0
+arabic-reshaper>=3.0.0
+python-bidi>=0.6.0
+reportlab>=4.2.0
+matplotlib>=3.10.0
+Pillow>=11.0.0

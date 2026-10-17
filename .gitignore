@@ -1,0 +1,30 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Databases
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Agent files & internal artifacts
+.agents/
+frames/
+*.zip
+modal_crop.png
+ORIGINAL_REQUEST.md
+PROJECT.md
+TEST_INFRA.md
+
+# Environment & credentials
+.env
+.venv/
+venv/
+ENV/
+
+# OS specific
+.DS_Store
+Thumbs.db
