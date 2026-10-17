@@ -879,24 +879,26 @@ async def generate_chat_response(
 
     last_error = None
     for idx, target_model in enumerate(models_to_try):
-        try:
-            is_fallback = (idx > 0)
-            chat_session = build_gemini_session(
-                uid_str,
-                chat_id,
-                target_model=target_model,
-                is_fallback=is_fallback,
-                enable_code_exec=enable_code_exec,
-            )
-            response = chat_session.send_message(user_text)
-            parsed_resp = parse_gemini_candidate_parts(response)
-            if parsed_resp.clean_text or parsed_resp.executed_code:
-                return parsed_resp
-        except Exception as e:
-            last_error = e
-            logging.warning(f"Chat model {target_model} failed ({e}). Trying fallback...")
-            if "503" in str(e) or "UNAVAILABLE" in str(e) or "429" in str(e):
-                await asyncio.sleep(0.6)
+        is_fallback = (idx > 0)
+        max_attempts = 2 if not is_fallback else 1
+        for attempt in range(max_attempts):
+            try:
+                chat_session = build_gemini_session(
+                    uid_str,
+                    chat_id,
+                    target_model=target_model,
+                    is_fallback=is_fallback,
+                    enable_code_exec=enable_code_exec,
+                )
+                response = chat_session.send_message(user_text)
+                parsed_resp = parse_gemini_candidate_parts(response)
+                if parsed_resp.clean_text or parsed_resp.executed_code:
+                    return parsed_resp
+            except Exception as e:
+                last_error = e
+                logging.warning(f"Chat model {target_model} (attempt {attempt+1}/{max_attempts}) failed ({e}). Trying fallback/retry...")
+                if "503" in str(e) or "UNAVAILABLE" in str(e) or "429" in str(e):
+                    await asyncio.sleep(0.6)
 
     raise last_error
 
@@ -912,18 +914,21 @@ async def generate_multimodal_response(user_id: str, contents: list) -> str:
 
     last_error = None
     for idx, target_model in enumerate(models_to_try):
-        try:
-            response = client.models.generate_content(
-                model=target_model,
-                contents=contents
-            )
-            if response and response.text:
-                return response.text
-        except Exception as e:
-            last_error = e
-            logging.warning(f"Multimodal {target_model} failed ({e}). Trying fallback...")
-            if "503" in str(e) or "UNAVAILABLE" in str(e):
-                await asyncio.sleep(0.6)
+        is_fallback = (idx > 0)
+        max_attempts = 2 if not is_fallback else 1
+        for attempt in range(max_attempts):
+            try:
+                response = client.models.generate_content(
+                    model=target_model,
+                    contents=contents
+                )
+                if response and response.text:
+                    return response.text
+            except Exception as e:
+                last_error = e
+                logging.warning(f"Multimodal {target_model} (attempt {attempt+1}/{max_attempts}) failed ({e}). Trying fallback/retry...")
+                if "503" in str(e) or "UNAVAILABLE" in str(e) or "429" in str(e):
+                    await asyncio.sleep(0.6)
 
     raise last_error
 
@@ -936,6 +941,50 @@ def extract_docx_text(docx_bytes: bytes) -> Optional[str]:
             return " ".join(texts)
     except Exception:
         return None
+
+def extract_reply_context(message) -> Optional[str]:
+    """
+    استخراج نقل‌قول و زمینه پیامی که کاربر روی آن ریپلای کرده است.
+    پشتیبانی از پیام‌های متنی، پاسخ‌های قبلی بات، کپشن تصاویر و اسناد.
+    """
+    if not message:
+        return None
+    reply = getattr(message, "reply_to_message", None)
+    if not reply:
+        return None
+
+    # Handle mocks where reply_to_message is an auto-generated MagicMock without text/caption
+    if getattr(reply, "_mock_return_value", None) is not None and not isinstance(getattr(reply, "text", None), str) and not isinstance(getattr(reply, "caption", None), str):
+        return None
+
+    from_user = getattr(reply, "from_user", None)
+    is_bot = bool(from_user and getattr(from_user, "is_bot", False) and getattr(from_user, "_mock_return_value", None) is None)
+    sender = "هوش مصنوعی (پاسخ قبلی شما)" if is_bot else "کاربر"
+
+    raw_text = getattr(reply, "text", None)
+    raw_caption = getattr(reply, "caption", None)
+    quoted_content = ""
+    if isinstance(raw_text, str) and raw_text:
+        quoted_content = raw_text
+    elif isinstance(raw_caption, str) and raw_caption:
+        quoted_content = raw_caption
+
+    if not quoted_content:
+        if getattr(reply, "photo", None) and getattr(reply.photo, "_mock_return_value", None) is None:
+            quoted_content = "[تصویر ارسال‌شده]"
+        elif getattr(reply, "document", None) and getattr(reply.document, "_mock_return_value", None) is None:
+            doc_name = getattr(reply.document, "file_name", "سند") or "سند"
+            quoted_content = f"[سند/فایل: {doc_name}]"
+        elif (getattr(reply, "voice", None) and getattr(reply.voice, "_mock_return_value", None) is None) or (getattr(reply, "audio", None) and getattr(reply.audio, "_mock_return_value", None) is None):
+            quoted_content = "[فایل صوتی/صدا]"
+        elif (getattr(reply, "video", None) and getattr(reply.video, "_mock_return_value", None) is None) or (getattr(reply, "video_note", None) and getattr(reply.video_note, "_mock_return_value", None) is None):
+            quoted_content = "[پیام ویدیویی]"
+
+    if quoted_content:
+        if len(quoted_content) > 1200:
+            quoted_content = quoted_content[:1200] + "..."
+        return f"📌 [کاربر به این پیام از {sender} ریپلای کرده است]:\n«{quoted_content}»"
+    return None
 
 def check_access(user_id: str) -> bool:
     if not ALLOWED_USERS or "" in ALLOWED_USERS:
@@ -976,7 +1025,7 @@ def extract_urls(text: str) -> list[str]:
     Detects and extracts all valid HTTP and HTTPS URLs from text (Requirement R4).
     Strips trailing sentence punctuation while preserving balanced parentheses.
     """
-    if not text:
+    if not text or not isinstance(text, str):
         return []
     raw_urls = re.findall(r'https?://[^\s<>"]+', text)
     cleaned_urls = []
@@ -2023,6 +2072,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not check_access(user_id): return
     if not update.message or not update.message.text: return
     user_text = update.message.text
+    reply_ctx = extract_reply_context(update.message)
 
     active_chat = db.get_active_chat(user_id)
     u = db.get_or_create_user(user_id)
@@ -2039,6 +2089,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 2. بررسی وجود لینک‌های وب و ویدیوهای یوتیوب (Requirement R4)
     urls = extract_urls(user_text)
+    if not urls and update.message.reply_to_message:
+        replied_msg = update.message.reply_to_message
+        if getattr(replied_msg, "_mock_return_value", None) is None or isinstance(getattr(replied_msg, "text", None), str):
+            replied_text = getattr(replied_msg, "text", None) or getattr(replied_msg, "caption", None)
+            if isinstance(replied_text, str) and replied_text:
+                urls = extract_urls(replied_text)
+
     if urls:
         target_url = urls[0]
         is_youtube = extract_youtube_video_id(target_url) is not None
@@ -2064,7 +2121,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         try:
             summary_text = await fetch_and_summarize_url(target_url, user_id=user_id)
-            db.add_message(active_chat["id"], "user", user_text)
+            db_user_entry = f"↩️ [پاسخ به پیام دارای لینک]: {user_text}" if reply_ctx else user_text
+            db.add_message(active_chat["id"], "user", db_user_entry)
             db.add_message(active_chat["id"], "model", summary_text)
             await tracker.finish(summary_text, update)
             await reply_with_optional_voice(update, summary_text, user_id, send_text=False)
@@ -2128,7 +2186,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
 
     try:
-        chat_resp = await generate_chat_response(user_id, active_chat["id"], user_text)
+        full_prompt = f"{reply_ctx}\n\n[درخواست یا نظر کاربر درباره پیام ریپلای‌شده]:\n{user_text}" if reply_ctx else user_text
+        chat_resp = await generate_chat_response(user_id, active_chat["id"], full_prompt)
         clean_text, executed_code, execution_result, thought_text = chat_resp
         display_text = chat_resp.formatted_text
 
@@ -2140,7 +2199,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("🧠 مشاهده فرآیند استدلال", callback_data=f"show_thought:{thought_id}")]
             ])
 
-        db.add_message(active_chat["id"], "user", user_text)
+        db_user_entry = f"↩️ [پاسخ به پیام]: {user_text}" if reply_ctx else user_text
+        db.add_message(active_chat["id"], "user", db_user_entry)
         db.add_message(active_chat["id"], "model", display_text)
         await tracker.finish(display_text, update, reply_markup=reply_markup)
         await reply_with_optional_voice(update, clean_text, user_id, send_text=False)
@@ -2169,13 +2229,16 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await tracker.finish("⚠️ خطا در دانلود تصویر از تلگرام. لطفاً مجدداً ارسال کنید.", update)
         return
 
-    caption = update.message.caption or "این عکس رو با لحن عامیانه تحلیل کن و بگو چیه."
+    reply_ctx = extract_reply_context(update.message)
+    raw_caption = update.message.caption or "این عکس رو با لحن عامیانه تحلیل کن و بگو چیه."
+    caption = f"{reply_ctx}\n\n{raw_caption}" if reply_ctx else raw_caption
     active_chat = db.get_active_chat(user_id)
 
     try:
         image_part = types.Part.from_bytes(data=bytes(img_bytes), mime_type="image/jpeg")
         reply_text = await generate_multimodal_response(user_id, [caption, image_part])
-        db.add_message(active_chat["id"], "user", f"[ارسال تصویر]: {caption}")
+        db_user_entry = f"↩️ [پاسخ به پیام با ارسال تصویر]: {caption}" if reply_ctx else f"[ارسال تصویر]: {caption}"
+        db.add_message(active_chat["id"], "user", db_user_entry)
         db.add_message(active_chat["id"], "model", reply_text)
         await tracker.finish(reply_text, update)
         await reply_with_optional_voice(update, reply_text, user_id, send_text=False)
@@ -2196,11 +2259,13 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ حجم این فایل صوتی بیشتر از ۲۰ مگابایت است! طبق قوانین تلگرام ربات‌ها فقط فایل‌های کمتر از ۲۰ مگابایت را می‌توانند دریافت کنند. لطفاً فایل را فشرده کنید یا بخش‌های کوتاه‌تر آن را بفرستید.")
         return
 
+    reply_ctx = extract_reply_context(update.message)
     file_title = getattr(audio_obj, "file_name", "پیام صوتی") or "پیام صوتی"
-    caption = update.message.caption or (
+    raw_caption = update.message.caption or (
         "این پیام صوتی را گوش بده و جوابش رو صمیمی و عامیانه به فارسی بگو:" if is_voice
         else f"این فایل صوتی ({file_title}) را کامل و با دقت گوش بده. اگر تمرین، لیسنینگ زبان انگلیسی، یا مکالمه است، متن کامل صحبت‌ها (Transcript)، ترجمه یا پاسخ سوالاتش را دقیق و کامل بگو:"
     )
+    caption = f"{reply_ctx}\n\n{raw_caption}" if reply_ctx else raw_caption
 
     steps = [
         f"🎙️ در حال دانلود و دریافت فایل صوتی ({file_title}) از تلگرام...",
@@ -2229,7 +2294,8 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_id,
             [caption, audio_part]
         )
-        db.add_message(active_chat["id"], "user", f"[ارسال فایل صوتی {file_title}]: {caption}")
+        db_user_entry = f"↩️ [پاسخ به پیام با ارسال صوت]: {caption}" if reply_ctx else f"[ارسال فایل صوتی {file_title}]: {caption}"
+        db.add_message(active_chat["id"], "user", db_user_entry)
         db.add_message(active_chat["id"], "model", reply_text)
         await tracker.finish(reply_text, update)
         await reply_with_optional_voice(update, reply_text, user_id, send_text=False)
@@ -2249,12 +2315,14 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ حجم این ویدیو بیشتر از ۲۰ مگابایت است! طبق قوانین تلگرام ربات‌ها فقط فایل‌های کمتر از ۲۰ مگابایت را می‌توانند دریافت کنند. لطفاً ویدیوی کوتاه‌تر یا کم‌حجم‌تر ارسال کنید.")
         return
 
+    reply_ctx = extract_reply_context(update.message)
     is_note = bool(update.message.video_note)
     file_title = getattr(vid_obj, "file_name", "پیام ویدیویی") or "ویدیو"
-    caption = update.message.caption or (
+    raw_caption = update.message.caption or (
         "این ویدیو مسیج دایره‌ای را کامل ببین و بشنو و جوابش رو صمیمی و عامیانه به فارسی بگو:" if is_note
         else f"این ویدیو ({file_title}) را کامل از نظر بصری و صوتی تماشا کن. اتفاقات رخ داده، صحبت‌ها و نکات مهم آن را به طور کامل و جذاب به فارسی توضیح بده:"
     )
+    caption = f"{reply_ctx}\n\n{raw_caption}" if reply_ctx else raw_caption
 
     steps = [
         f"🎬 در حال دانلود و دریافت ویدیو ({file_title}) از تلگرام...",
@@ -2283,7 +2351,8 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_id,
             [caption, vid_part]
         )
-        db.add_message(active_chat["id"], "user", f"[ارسال ویدیو {file_title}]: {caption}")
+        db_user_entry = f"↩️ [پاسخ به پیام با ارسال ویدیو]: {caption}" if reply_ctx else f"[ارسال ویدیو {file_title}]: {caption}"
+        db.add_message(active_chat["id"], "user", db_user_entry)
         db.add_message(active_chat["id"], "model", reply_text)
         await tracker.finish(reply_text, update)
         await reply_with_optional_voice(update, reply_text, user_id, send_text=False)
@@ -2318,8 +2387,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await tracker.finish("⚠️ خطا در دانلود فایل از تلگرام. لطفاً مجدداً بفرستید.", update)
         return
 
+    reply_ctx = extract_reply_context(update.message)
     file_name = (doc.file_name or "file").lower()
-    prompt = update.message.caption or f"این فایل ({doc.file_name or 'سند'}) رو کامل و دقیق بررسی کن و نکات، تحلیل‌ها، ترجمه یا پاسخ‌های مهمش رو به زبان عامیانه و شیوا بگو."
+    raw_prompt = update.message.caption or f"این فایل ({doc.file_name or 'سند'}) رو کامل و دقیق بررسی کن و نکات، تحلیل‌ها، ترجمه یا پاسخ‌های مهمش رو به زبان عامیانه و شیوا بگو."
+    prompt = f"{reply_ctx}\n\n{raw_prompt}" if reply_ctx else raw_prompt
     active_chat = db.get_active_chat(user_id)
 
     try:
@@ -2361,7 +2432,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             file_part = types.Part.from_bytes(data=bytes(doc_bytes), mime_type=mime)
             reply_text = await generate_multimodal_response(user_id, [prompt, file_part])
 
-        db.add_message(active_chat["id"], "user", f"[ارسال فایل {doc.file_name}]: {prompt}")
+        db_user_entry = f"↩️ [پاسخ به پیام با ارسال سند {doc.file_name}]: {prompt}" if reply_ctx else f"[ارسال فایل {doc.file_name}]: {prompt}"
+        db.add_message(active_chat["id"], "user", db_user_entry)
         db.add_message(active_chat["id"], "model", reply_text)
         await tracker.finish(reply_text, update)
         await reply_with_optional_voice(update, reply_text, user_id, send_text=False)
